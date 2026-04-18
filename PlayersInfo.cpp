@@ -3,6 +3,7 @@
 #include "schemasystem/schemasystem.h"
 #include <nlohmann/json.hpp>
 
+#include <cstring>
 #include <ctime>
 #include <cstdio>
 #include <string>
@@ -23,6 +24,8 @@ IUtilsApi *g_pUtils = nullptr;
 IPlayersApi *g_pPlayers = nullptr;
 ILRApi *g_pLRCore = nullptr;
 
+CGameEntitySystem *GameEntitySystem() { return g_pGameEntitySystem; }
+
 namespace {
 
 constexpr int kMaxPlayers = 64;
@@ -40,27 +43,58 @@ bool IsValidSlot(int slot) noexcept {
 }
 
 bool IsRealPlayer(int slot) {
-  return g_pPlayers && g_pPlayers->IsConnected(slot) &&
-         !g_pPlayers->IsFakeClient(slot);
+  if (g_pPlayers)
+    return g_pPlayers->IsConnected(slot) && !g_pPlayers->IsFakeClient(slot);
+  CCSPlayerController *ctrl = CCSPlayerController::FromSlot(slot);
+  return ctrl != nullptr;
 }
 
-bool CheckPrime(uint64 steamid64) {
+bool LookupPrime(uint64 steamid64) {
   if (steamid64 == 0)
     return false;
-
   auto it = g_PrimeCache.find(steamid64);
-  if (it != g_PrimeCache.end())
-    return it->second;
+  return it != g_PrimeCache.end() ? it->second : false;
+}
 
+void CachePrime(uint64 steamid64) {
+  if (steamid64 == 0 || g_PrimeCache.count(steamid64))
+    return;
   ISteamGameServer *pServer = SteamGameServer();
   if (!pServer)
-    return false;
-
+    return;
   CSteamID id(steamid64);
   const bool prime = pServer->UserHasLicenseForApp(id, kAppPrime) == 0 ||
                      pServer->UserHasLicenseForApp(id, kAppPrimeLegacy) == 0;
   g_PrimeCache.emplace(steamid64, prime);
-  return prime;
+}
+
+std::string SanitizeUtf8(const char *s) {
+  if (!s || !*s)
+    return std::string();
+  std::string out;
+  out.reserve(strlen(s));
+  const unsigned char *p = reinterpret_cast<const unsigned char *>(s);
+  while (*p) {
+    unsigned char c = *p;
+    int len;
+    if (c < 0x80) len = 1;
+    else if ((c & 0xE0) == 0xC0) len = 2;
+    else if ((c & 0xF0) == 0xE0) len = 3;
+    else if ((c & 0xF8) == 0xF0) len = 4;
+    else { ++p; continue; }
+
+    bool valid = true;
+    for (int i = 1; i < len; ++i) {
+      if ((p[i] & 0xC0) != 0x80) { valid = false; break; }
+    }
+    if (valid) {
+      out.append(reinterpret_cast<const char *>(p), len);
+      p += len;
+    } else {
+      ++p;
+    }
+  }
+  return out;
 }
 
 void ConPrintChunked(const std::string &str) {
@@ -103,11 +137,13 @@ std::string GetMapNameSafe() {
 json BuildPlayerJson(int slot, CCSPlayerController *ctrl, time_t now) {
   json j;
 
-  const char *name = g_pPlayers->GetPlayerName(slot);
-  const uint64 steamid64 = g_pPlayers->GetSteamID64(slot);
+  const char *name = g_pPlayers ? g_pPlayers->GetPlayerName(slot)
+                                : ctrl->GetPlayerName();
+  const uint64 steamid64 = g_pPlayers ? g_pPlayers->GetSteamID64(slot) : 0;
 
+  std::string sanitized = SanitizeUtf8(name);
   j["userid"] = slot;
-  j["name"] = (name && name[0] != '\0') ? name : "Unknown";
+  j["name"] = sanitized.empty() ? std::string("Unknown") : sanitized;
   j["team"] = ctrl->GetTeam();
   j["steamid"] = std::to_string(steamid64);
 
@@ -123,7 +159,7 @@ json BuildPlayerJson(int slot, CCSPlayerController *ctrl, time_t now) {
 
   j["ping"] = ctrl->m_iPing();
   j["playtime"] = static_cast<int64_t>(now - g_ConnectionTime[slot]);
-  j["prime"] = CheckPrime(steamid64);
+  j["prime"] = LookupPrime(steamid64);
   j["alive"] = (ctrl->m_hPlayerPawn() != nullptr);
 
   if (g_pLRCore && g_pLRCore->GetClientStatus(slot))
@@ -146,13 +182,13 @@ json GetServerInfo() {
   json players = json::array();
   if (g_pPlayers) {
     for (int i = 0; i < kMaxPlayers; ++i) {
-      if (g_ConnectionTime[i] == 0)
-        continue;
-
       if (!IsRealPlayer(i)) {
         g_ConnectionTime[i] = 0;
         continue;
       }
+
+      if (g_ConnectionTime[i] == 0)
+        g_ConnectionTime[i] = now;
 
       CCSPlayerController *ctrl = CCSPlayerController::FromSlot(i);
       if (!ctrl)
@@ -191,9 +227,13 @@ static void OnPlayerConnect(const char *, IGameEvent *pEvent, bool) {
   const int slot = pEvent->GetInt("userid");
   if (!IsValidSlot(slot))
     return;
-  if (g_pPlayers && g_pPlayers->IsFakeClient(slot))
-    return;
   g_ConnectionTime[slot] = std::time(nullptr);
+}
+
+static void OnClientAuthorized(int slot, uint64 steamid64) {
+  if (IsValidSlot(slot) && g_ConnectionTime[slot] == 0)
+    g_ConnectionTime[slot] = std::time(nullptr);
+  CachePrime(steamid64);
 }
 
 static void OnPlayerDisconnect(const char *, IGameEvent *pEvent, bool) {
@@ -255,6 +295,7 @@ void PlayersInfo::AllPluginsLoaded() {
   g_pUtils->StartupServer(g_PLID, OnStartupServer);
   g_pUtils->HookEvent(g_PLID, "player_connect", OnPlayerConnect);
   g_pUtils->HookEvent(g_PLID, "player_disconnect", OnPlayerDisconnect);
+  g_pPlayers->HookOnClientAuthorized(g_PLID, OnClientAuthorized);
 }
 
 const char *PlayersInfo::GetLicense() { return "GPL"; }
