@@ -3,9 +3,10 @@
 #include "schemasystem/schemasystem.h"
 #include <nlohmann/json.hpp>
 
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
-#include <cstdio>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -45,8 +46,7 @@ bool IsValidSlot(int slot) noexcept {
 bool IsRealPlayer(int slot) {
   if (g_pPlayers)
     return g_pPlayers->IsConnected(slot) && !g_pPlayers->IsFakeClient(slot);
-  CCSPlayerController *ctrl = CCSPlayerController::FromSlot(slot);
-  return ctrl != nullptr;
+  return CCSPlayerController::FromSlot(slot) != nullptr;
 }
 
 bool LookupPrime(uint64 steamid64) {
@@ -103,6 +103,26 @@ void ConPrintChunked(const std::string &str) {
     META_CONPRINT(str.substr(i, kConsoleChunk).c_str());
 }
 
+bool WriteFileAtomic(const char *path, const std::string &data) {
+  if (!path || !*path)
+    return false;
+  std::string tmp = std::string(path) + ".tmp";
+  FILE *f = std::fopen(tmp.c_str(), "wb");
+  if (!f)
+    return false;
+  const size_t written = std::fwrite(data.data(), 1, data.size(), f);
+  std::fclose(f);
+  if (written != data.size()) {
+    std::remove(tmp.c_str());
+    return false;
+  }
+  if (std::rename(tmp.c_str(), path) != 0) {
+    std::remove(tmp.c_str());
+    return false;
+  }
+  return true;
+}
+
 struct TeamScores {
   int ct = 0;
   int t = 0;
@@ -137,8 +157,7 @@ std::string GetMapNameSafe() {
 json BuildPlayerJson(int slot, CCSPlayerController *ctrl, time_t now) {
   json j;
 
-  const char *name = g_pPlayers ? g_pPlayers->GetPlayerName(slot)
-                                : ctrl->GetPlayerName();
+  const char *name = g_pPlayers ? g_pPlayers->GetPlayerName(slot) : nullptr;
   const uint64 steamid64 = g_pPlayers ? g_pPlayers->GetSteamID64(slot) : 0;
 
   std::string sanitized = SanitizeUtf8(name);
@@ -180,22 +199,20 @@ json GetServerInfo() {
   jdata["score_t"] = scores.t;
 
   json players = json::array();
-  if (g_pPlayers) {
-    for (int i = 0; i < kMaxPlayers; ++i) {
-      if (!IsRealPlayer(i)) {
-        g_ConnectionTime[i] = 0;
-        continue;
-      }
-
-      if (g_ConnectionTime[i] == 0)
-        g_ConnectionTime[i] = now;
-
-      CCSPlayerController *ctrl = CCSPlayerController::FromSlot(i);
-      if (!ctrl)
-        continue;
-
-      players.push_back(BuildPlayerJson(i, ctrl, now));
+  for (int i = 0; i < kMaxPlayers; ++i) {
+    if (!IsRealPlayer(i)) {
+      g_ConnectionTime[i] = 0;
+      continue;
     }
+
+    if (g_ConnectionTime[i] == 0)
+      g_ConnectionTime[i] = now;
+
+    CCSPlayerController *ctrl = CCSPlayerController::FromSlot(i);
+    if (!ctrl)
+      continue;
+
+    players.push_back(BuildPlayerJson(i, ctrl, now));
   }
 
   jdata["player_count"] = players.size();
@@ -205,8 +222,43 @@ json GetServerInfo() {
 
 }  // namespace
 
-CON_COMMAND_F(mm_getinfo, "", FCVAR_GAMEDLL) {
+CON_COMMAND_F(mm_getinfo, "Dump full server info as JSON to console",
+              FCVAR_GAMEDLL) {
   const std::string dump = GetServerInfo().dump();
+  ConPrintChunked(dump);
+  META_CONPRINT("\n");
+}
+
+CON_COMMAND_F(mm_getinfo_file,
+              "Dump full server info as JSON to <path> atomically",
+              FCVAR_GAMEDLL) {
+  if (args.ArgC() < 2) {
+    META_CONPRINT("usage: mm_getinfo_file <path>\n");
+    return;
+  }
+  const std::string dump = GetServerInfo().dump();
+  if (WriteFileAtomic(args[1], dump))
+    META_CONPRINT("mm_getinfo_file: ok\n");
+  else
+    META_CONPRINT("mm_getinfo_file: failed\n");
+}
+
+CON_COMMAND_F(mm_getinfo_slot,
+              "Dump single player JSON for slot <N> (or {} if empty)",
+              FCVAR_GAMEDLL) {
+  if (args.ArgC() < 2) {
+    META_CONPRINT("usage: mm_getinfo_slot <slot>\n");
+    return;
+  }
+  const int slot = std::atoi(args[1]);
+  json j;
+  if (IsValidSlot(slot) && IsRealPlayer(slot)) {
+    if (g_ConnectionTime[slot] == 0)
+      g_ConnectionTime[slot] = std::time(nullptr);
+    if (CCSPlayerController *ctrl = CCSPlayerController::FromSlot(slot))
+      j = BuildPlayerJson(slot, ctrl, std::time(nullptr));
+  }
+  const std::string dump = j.is_null() ? std::string("{}") : j.dump();
   ConPrintChunked(dump);
   META_CONPRINT("\n");
 }
@@ -260,6 +312,8 @@ bool PlayersInfo::Load(PluginId id, ISmmAPI *ismm, char *error, size_t maxlen,
 }
 
 bool PlayersInfo::Unload(char *error, size_t maxlen) {
+  if (g_pUtils)
+    g_pUtils->ClearAllHooks(g_PLID);
   ConVar_Unregister();
   g_PrimeCache.clear();
   for (int i = 0; i < kMaxPlayers; ++i)
@@ -299,7 +353,7 @@ void PlayersInfo::AllPluginsLoaded() {
 }
 
 const char *PlayersInfo::GetLicense() { return "GPL"; }
-const char *PlayersInfo::GetVersion() { return "1.1.0"; }
+const char *PlayersInfo::GetVersion() { return "1.2.0"; }
 const char *PlayersInfo::GetDate() { return __DATE__; }
 const char *PlayersInfo::GetLogTag() { return "PlayersInfo"; }
 const char *PlayersInfo::GetAuthor() { return "Pisex"; }
