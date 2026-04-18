@@ -56,6 +56,7 @@ jobs:
           cd ../..
 
           git clone https://github.com/pisex/SchemaEntity.git
+          sed -i 's/NetworkStateChanged_t/NetworkStateChangedData/g' SchemaEntity/schemasystem.cpp
                   
       - name: Configure and build plugin
         run: |
