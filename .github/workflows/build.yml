@@ -57,6 +57,8 @@ jobs:
 
           git clone https://github.com/pisex/SchemaEntity.git
           sed -i 's/NetworkStateChanged_t/NetworkStateChangedData/g' SchemaEntity/schemasystem.cpp
+          sed -i 's/FL_PAWN_FAKECLIENT/FL_FAKECLIENT/g' SchemaEntity/CCSPlayerPawn.h
+          sed -i 's/FL_CONTROLLER_FAKECLIENT/FL_FAKECLIENT/g' SchemaEntity/CCSPlayerController.h
                   
       - name: Configure and build plugin
         run: |

@@ -66,7 +66,7 @@ bool CheckPrime(uint64 steamid64) {
 void ConPrintChunked(const std::string &str) {
   const size_t n = str.size();
   for (size_t i = 0; i < n; i += kConsoleChunk)
-    META_CONPRINT("%s", str.substr(i, kConsoleChunk).c_str());
+    META_CONPRINT(str.substr(i, kConsoleChunk).c_str());
 }
 
 struct TeamScores {
@@ -113,10 +113,9 @@ json BuildPlayerJson(int slot, CCSPlayerController *ctrl, time_t now) {
 
   int kills = 0, deaths = 0, headshots = 0;
   if (auto *ats = ctrl->m_pActionTrackingServices()) {
-    const auto &stats = ats->m_matchStats();
-    kills = stats.m_iKills();
-    deaths = stats.m_iDeaths();
-    headshots = stats.m_iHeadShotKills();
+    kills = ats->m_matchStats().m_iKills();
+    deaths = ats->m_matchStats().m_iDeaths();
+    headshots = ats->m_matchStats().m_iHeadShotKills();
   }
   j["kills"] = kills;
   j["death"] = deaths;
