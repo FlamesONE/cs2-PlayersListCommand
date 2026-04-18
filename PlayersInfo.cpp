@@ -33,20 +33,35 @@ constexpr int kMaxPlayers = 64;
 constexpr int kTeamCT = 3;
 constexpr int kTeamT = 2;
 constexpr AppId_t kAppPrime = 624820;
-constexpr AppId_t kAppPrimeLegacy = 54029;
 constexpr size_t kConsoleChunk = 1024;
 
 time_t g_ConnectionTime[kMaxPlayers] = {};
 std::unordered_map<uint64, bool> g_PrimeCache;
+CSteamGameServerAPIContext g_SteamApi;
+bool g_SteamApiReady = false;
 
 bool IsValidSlot(int slot) noexcept {
   return slot >= 0 && slot < kMaxPlayers;
 }
 
 bool IsRealPlayer(int slot) {
-  if (g_pPlayers)
-    return g_pPlayers->IsConnected(slot) && !g_pPlayers->IsFakeClient(slot);
-  return CCSPlayerController::FromSlot(slot) != nullptr;
+  if (gpGlobals && slot >= gpGlobals->maxClients)
+    return false;
+  CCSPlayerController *ctrl = CCSPlayerController::FromSlot(slot);
+  if (!ctrl)
+    return false;
+  if (ctrl->m_iConnected() != PlayerConnectedState::PlayerConnected)
+    return false;
+  if (ctrl->IsBot())
+    return false;
+  return true;
+}
+
+bool EnsureSteamApi() {
+  if (g_SteamApiReady)
+    return true;
+  g_SteamApiReady = g_SteamApi.Init();
+  return g_SteamApiReady;
 }
 
 bool LookupPrime(uint64 steamid64) {
@@ -59,12 +74,14 @@ bool LookupPrime(uint64 steamid64) {
 void CachePrime(uint64 steamid64) {
   if (steamid64 == 0 || g_PrimeCache.count(steamid64))
     return;
-  ISteamGameServer *pServer = SteamGameServer();
-  if (!pServer)
+  if (!EnsureSteamApi())
+    return;
+  ISteamGameServer *pServer = g_SteamApi.SteamGameServer();
+  if (!pServer || !pServer->BLoggedOn())
     return;
   CSteamID id(steamid64);
-  const bool prime = pServer->UserHasLicenseForApp(id, kAppPrime) == 0 ||
-                     pServer->UserHasLicenseForApp(id, kAppPrimeLegacy) == 0;
+  const bool prime = pServer->UserHasLicenseForApp(id, kAppPrime) ==
+                     k_EUserHasLicenseResultHasLicense;
   g_PrimeCache.emplace(steamid64, prime);
 }
 
@@ -72,7 +89,7 @@ std::string SanitizeUtf8(const char *s) {
   if (!s || !*s)
     return std::string();
   std::string out;
-  out.reserve(strlen(s));
+  out.reserve(std::strlen(s));
   const unsigned char *p = reinterpret_cast<const unsigned char *>(s);
   while (*p) {
     unsigned char c = *p;
@@ -157,8 +174,8 @@ std::string GetMapNameSafe() {
 json BuildPlayerJson(int slot, CCSPlayerController *ctrl, time_t now) {
   json j;
 
-  const char *name = g_pPlayers ? g_pPlayers->GetPlayerName(slot) : nullptr;
-  const uint64 steamid64 = g_pPlayers ? g_pPlayers->GetSteamID64(slot) : 0;
+  const char *name = ctrl->GetPlayerName();
+  const uint64 steamid64 = ctrl->m_steamID();
 
   std::string sanitized = SanitizeUtf8(name);
   j["userid"] = slot;
@@ -178,6 +195,7 @@ json BuildPlayerJson(int slot, CCSPlayerController *ctrl, time_t now) {
 
   j["ping"] = ctrl->m_iPing();
   j["playtime"] = static_cast<int64_t>(now - g_ConnectionTime[slot]);
+  CachePrime(steamid64);
   j["prime"] = LookupPrime(steamid64);
   j["alive"] = (ctrl->m_hPlayerPawn() != nullptr);
 
@@ -198,8 +216,14 @@ json GetServerInfo() {
   jdata["score_ct"] = scores.ct;
   jdata["score_t"] = scores.t;
 
+  const int slotLimit =
+      (gpGlobals && gpGlobals->maxClients > 0 &&
+       gpGlobals->maxClients < kMaxPlayers)
+          ? gpGlobals->maxClients
+          : kMaxPlayers;
+
   json players = json::array();
-  for (int i = 0; i < kMaxPlayers; ++i) {
+  for (int i = 0; i < slotLimit; ++i) {
     if (!IsRealPlayer(i)) {
       g_ConnectionTime[i] = 0;
       continue;
@@ -264,15 +288,15 @@ CON_COMMAND_F(mm_getinfo_slot,
 }
 
 static void OnStartupServer() {
+  if (!g_pUtils)
+    return;
   g_pGameEntitySystem = g_pUtils->GetCGameEntitySystem();
   g_pEntitySystem = g_pUtils->GetCEntitySystem();
   gpGlobals = g_pUtils->GetCGlobalVars();
 
   g_PrimeCache.clear();
-
-  const time_t now = std::time(nullptr);
   for (int i = 0; i < kMaxPlayers; ++i)
-    g_ConnectionTime[i] = IsRealPlayer(i) ? now : 0;
+    g_ConnectionTime[i] = 0;
 }
 
 static void OnPlayerConnect(const char *, IGameEvent *pEvent, bool) {
@@ -280,12 +304,6 @@ static void OnPlayerConnect(const char *, IGameEvent *pEvent, bool) {
   if (!IsValidSlot(slot))
     return;
   g_ConnectionTime[slot] = std::time(nullptr);
-}
-
-static void OnClientAuthorized(int slot, uint64 steamid64) {
-  if (IsValidSlot(slot) && g_ConnectionTime[slot] == 0)
-    g_ConnectionTime[slot] = std::time(nullptr);
-  CachePrime(steamid64);
 }
 
 static void OnPlayerDisconnect(const char *, IGameEvent *pEvent, bool) {
@@ -316,6 +334,7 @@ bool PlayersInfo::Unload(char *error, size_t maxlen) {
     g_pUtils->ClearAllHooks(g_PLID);
   ConVar_Unregister();
   g_PrimeCache.clear();
+  g_SteamApiReady = false;
   for (int i = 0; i < kMaxPlayers; ++i)
     g_ConnectionTime[i] = 0;
   return true;
@@ -333,14 +352,6 @@ void PlayersInfo::AllPluginsLoaded() {
     return;
   }
 
-  g_pPlayers = static_cast<IPlayersApi *>(
-      g_SMAPI->MetaFactory(PLAYERS_INTERFACE, &ret, nullptr));
-  if (ret == META_IFACE_FAILED) {
-    g_pUtils->ErrorLog("[%s] Missing Players system plugin", GetLogTag());
-    engine->ServerCommand(("meta unload " + std::to_string(g_PLID)).c_str());
-    return;
-  }
-
   g_pLRCore = static_cast<ILRApi *>(
       g_SMAPI->MetaFactory(LR_INTERFACE, &ret, nullptr));
   if (ret == META_IFACE_FAILED)
@@ -349,11 +360,13 @@ void PlayersInfo::AllPluginsLoaded() {
   g_pUtils->StartupServer(g_PLID, OnStartupServer);
   g_pUtils->HookEvent(g_PLID, "player_connect", OnPlayerConnect);
   g_pUtils->HookEvent(g_PLID, "player_disconnect", OnPlayerDisconnect);
-  g_pPlayers->HookOnClientAuthorized(g_PLID, OnClientAuthorized);
+
+  if (!gpGlobals)
+    OnStartupServer();
 }
 
 const char *PlayersInfo::GetLicense() { return "GPL"; }
-const char *PlayersInfo::GetVersion() { return "1.1.0"; }
+const char *PlayersInfo::GetVersion() { return "1.2.0"; }
 const char *PlayersInfo::GetDate() { return __DATE__; }
 const char *PlayersInfo::GetLogTag() { return "PlayersInfo"; }
 const char *PlayersInfo::GetAuthor() { return "Pisex"; }
